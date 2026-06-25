@@ -1,0 +1,366 @@
+{
+  "name": "Vector Store Builder",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1Wy0K-fXV5-BwAJ-r_dq5-d8xxFzYJYH8",
+          "mode": "id"
+        },
+        "event": "fileCreated",
+        "options": {}
+      },
+      "id": "873e95c9-6bba-450a-b4c9-c57e3e569489",
+      "name": "Google Drive Trigger",
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "vlO6ncs8pycU7JJw",
+          "name": "Google Drive OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "__CUSTOM_API_CALL__"
+      },
+      "id": "4610e819-0eee-401f-a3b3-7de4576b290f",
+      "name": "Download File from Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        160,
+        752
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "vlO6ncs8pycU7JJw",
+          "name": "Google Drive OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond-pdf",
+              "leftValue": "={{ $('Google Drive Trigger').item.json.mimeType }}",
+              "rightValue": "application/pdf",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "b95c7b05-8782-4fa4-a31f-457ecfd6ec11",
+      "name": "Filter: PDF or Docs Only",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        400,
+        752
+      ],
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.item.json;\n\n// El Google Drive Trigger ya nos da el nombre e ID\nconst fileName = item.name || 'unknown_file';\nconst fileId = item.id;\nconst mimeType = item.mimeType;\nconst createdTime = item.createdTime;\n\n// Para Google Docs, el texto viene en el campo description o snippet\n// Usamos un texto de muestra por ahora para validar el flujo\nconst rawText = item.description || item.snippet || \n  `AIO Strategy es una consultora de AI y datos B2B con sede en Querétaro, México. \n  Especializada en manufactura, agroindustria y logística en la región Bajío.\n  Servicios: Diagnóstico de madurez de datos, Implementación de pipelines de ML, \n  Automatización de procesos con AI, Dashboards de inteligencia de negocio.\n  Sectores: Manufactura industrial, Agroindustria, Logística y cadena de suministro.`;\n\nreturn [{\n  json: {\n    fileName,\n    fileId,\n    mimeType,\n    createdTime,\n    rawText,\n    source: 'AIO Strategy Knowledge Base'\n  }\n}];"
+      },
+      "id": "1ac38996-bf60-4171-9aa4-f89154fc8f6c",
+      "name": "Extract Text from File",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        272,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Chunk text into overlapping segments for better RAG retrieval\n// Strategy: 500 tokens (~2000 chars) with 100-token overlap\nconst CHUNK_SIZE = 2000;\nconst CHUNK_OVERLAP = 400;\n\nconst { rawText, fileName, fileId, createdTime } = $input.item.json;\n\nif (!rawText || rawText.trim().length === 0) {\n  return [];\n}\n\nconst cleanText = rawText\n  .replace(/\\s+/g, ' ')\n  .replace(/[^\\w\\s.,;:!?()\\-áéíóúÁÉÍÓÚñÑüÜ]/g, '')\n  .trim();\n\nconst chunks = [];\nlet start = 0;\nlet chunkIndex = 0;\n\nwhile (start < cleanText.length) {\n  const end = Math.min(start + CHUNK_SIZE, cleanText.length);\n  let chunkText = cleanText.substring(start, end);\n  \n  // Try to break at sentence boundary\n  if (end < cleanText.length) {\n    const lastPeriod = Math.max(\n      chunkText.lastIndexOf('. '),\n      chunkText.lastIndexOf('\\n')\n    );\n    if (lastPeriod > CHUNK_SIZE * 0.7) {\n      chunkText = chunkText.substring(0, lastPeriod + 1);\n    }\n  }\n  \n  if (chunkText.trim().length > 100) {\n    chunks.push({\n      json: {\n        chunkId: `${fileId}_chunk_${chunkIndex}`,\n        chunkIndex,\n        chunkText: chunkText.trim(),\n        fileName,\n        fileId,\n        createdTime,\n        source: 'AIO Strategy Knowledge Base',\n        totalChunks: -1 // placeholder, updated below\n      }\n    });\n    chunkIndex++;\n  }\n  \n  start += CHUNK_SIZE - CHUNK_OVERLAP;\n}\n\n// Update totalChunks\nchunks.forEach(c => { c.json.totalChunks = chunkIndex; });\n\n// Pre-build Gemini request body\nchunks.forEach(c => {\n  c.json.geminiBody = JSON.stringify({\n    model: \"models/text-embedding-004\",\n    content: { parts: [{ text: c.json.chunkText }] }\n  });\n});\n\nreturn chunks;"
+      },
+      "id": "dde07cc3-1c6e-47a9-af9d-d1a04082b94a",
+      "name": "Text Chunker (500t / 100t overlap)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=YOUR_GEMINI_API_KEY",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{$json.geminiBodyString}}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 100
+            }
+          }
+        }
+      },
+      "id": "97d4cd5f-75da-4430-8626-323192af6ca5",
+      "name": "Generate Embeddings (OpenAI text-embedding-3-small)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Pinecone upsert payload\nconst embeddingData = $input.item.json;\nconst chunkData = $('Text Chunker (500t / 100t overlap)').item.json;\n\nconst vector = $input.item.json.embedding.values;\n\nconst upsertPayload = {\n  vectors: [\n    {\n      id: chunkData.chunkId,\n      values: vector,\n      metadata: {\n        text: chunkData.chunkText,\n        fileName: chunkData.fileName,\n        fileId: chunkData.fileId,\n        chunkIndex: chunkData.chunkIndex,\n        totalChunks: chunkData.totalChunks,\n        source: chunkData.source,\n        createdTime: chunkData.createdTime\n      }\n    }\n  ],\n  namespace: \"aio-strategy-docs\"\n};\n\nreturn [{ json: upsertPayload }];"
+      },
+      "id": "6f28d00f-e6a7-4aa6-815c-aa26be73f91c",
+      "name": "Build Pinecone Upsert Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1296,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://aio-strategy-kb-e77nyao.svc.aped-4627-b74a.pinecone.io/vectors/upsert",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Api-Key",
+              "value": "YOUR_PINECONE_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "8ab67265-c265-41f5-9ae7-542638eed927",
+      "name": "Upsert to Pinecone",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1552,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "Z3I2mj2SISKeC8g8",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.item.json;\nconst chunkId = $('Build Pinecone Upsert Payload').item.json.vectors[0].id;\n\nconsole.log(`✅ Upserted chunk: ${chunkId}`);\nconsole.log(`Pinecone response:`, JSON.stringify(result));\n\nreturn [{\n  json: {\n    status: 'success',\n    chunkId,\n    upsertedCount: result.upsertedCount || 1,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "d039054e-d2b8-47b4-9525-9d856e360587",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "==https://www.googleapis.com/drive/v3/files/{{ $json.id }}/export?mimeType=text/plain",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        640,
+        752
+      ],
+      "id": "25167767-64a4-423b-aa1e-e34e8237fd48",
+      "name": "HTTP Request",
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "0B6bFVUWNy6xf5RX",
+          "name": "Query Auth account"
+        },
+        "googleDriveOAuth2Api": {
+          "id": "vlO6ncs8pycU7JJw",
+          "name": "Google Drive OAuth2 API"
+        }
+      },
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.item.json;\n\nreturn [{\n  json: {\n    ...item,\n    geminiBodyString: `{\"model\":\"models/gemini-embedding-001\",\"content\":{\"parts\":[{\"text\":${JSON.stringify(item.chunkText)}}]}}`\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        0
+      ],
+      "id": "aab9a7cc-d470-423f-8212-f4a94276d6f7",
+      "name": "Code in JavaScript"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Google Drive Trigger": {
+      "main": [
+        [
+          {
+            "node": "Extract Text from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download File from Drive": {
+      "main": [
+        []
+      ]
+    },
+    "Filter: PDF or Docs Only": {
+      "main": [
+        []
+      ]
+    },
+    "Extract Text from File": {
+      "main": [
+        [
+          {
+            "node": "Text Chunker (500t / 100t overlap)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Text Chunker (500t / 100t overlap)": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Embeddings (OpenAI text-embedding-3-small)": {
+      "main": [
+        [
+          {
+            "node": "Build Pinecone Upsert Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Pinecone Upsert Payload": {
+      "main": [
+        [
+          {
+            "node": "Upsert to Pinecone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert to Pinecone": {
+      "main": [
+        [
+          {
+            "node": "Log Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        []
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Generate Embeddings (OpenAI text-embedding-3-small)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "67d1778b-a0a7-4cfe-95d2-45fcc81d42a9",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "53f75d45acc384e2fc73dc41ec81238b8c0f40a9f721c0444cf58597c8619ead"
+  },
+  "nodeGroups": [],
+  "id": "nUtNKQ0jvLrOakLY",
+  "tags": []
+}

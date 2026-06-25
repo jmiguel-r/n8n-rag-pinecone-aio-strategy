@@ -1,1 +1,3 @@
 *.json
+!workflows/*.json
+.DS_Store

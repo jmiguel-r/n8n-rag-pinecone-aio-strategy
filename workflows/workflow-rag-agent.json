@@ -1,0 +1,313 @@
+{
+  "name": "RAG Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aio-rag-chat",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "e0b23ad9-6b4e-4e48-89b4-fe6d0ab1fe77",
+      "name": "Webhook Chat Endpoint",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        0
+      ],
+      "webhookId": "aio-strategy-rag-agent"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate incoming chat request\nconst body = $input.item.json.body || $input.item.json;\nconst userMessage = body.message || body.query || body.question || '';\nconst sessionId = body.sessionId || `session_${Date.now()}`;\nconst chatHistory = body.history || [];\n\nif (!userMessage.trim()) {\n  throw new Error('No message provided in request body. Expected: { \"message\": \"your question\" }');\n}\n\n// Build Gemini embedding body string\nconst geminiBodyString = JSON.stringify({\n  model: \"models/gemini-embedding-001\",\n  content: {\n    parts: [{ text: userMessage.trim() }]\n  },\n  taskType: \"RETRIEVAL_QUERY\"\n});\n\nreturn [{\n  json: {\n    userMessage: userMessage.trim(),\n    sessionId,\n    chatHistory,\n    timestamp: new Date().toISOString(),\n    geminiBodyString\n  }\n}];"
+      },
+      "id": "cf7298b9-e8ca-46ac-a2c3-59a578bca2f9",
+      "name": "Parse & Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=YOUR_GEMINI_API_KEY",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{$json.geminiBodyString}}",
+        "options": {}
+      },
+      "id": "008f43c2-7ae4-41d5-9ec8-6ad016703d7f",
+      "name": "Embed User Query",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        384,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://aio-strategy-kb-e77nyao.svc.aped-4627-b74a.pinecone.io/query",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Api-Key",
+              "value": "YOUR_PINECONE_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{$json.pineconeBodyString}}",
+        "options": {}
+      },
+      "id": "c8254f1b-2d8c-4335-9b61-f9501e9a8421",
+      "name": "Query Pinecone (Top-5 Retrieval)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        752,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "Z3I2mj2SISKeC8g8",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const pineconeResult = $input.item.json;\nconst userMessage = $('Parse & Validate Input').item.json.userMessage;\nconst chatHistory = $('Parse & Validate Input').item.json.chatHistory;\nconst sessionId = $('Parse & Validate Input').item.json.sessionId;\nconst matches = pineconeResult.matches || [];\n\n// Filter by relevance score threshold\nconst relevantMatches = matches.filter(m => m.score > 0.35);\n\nif (relevantMatches.length === 0) {\n  return [{\n    json: {\n      userMessage,\n      sessionId,\n      chatHistory,\n      retrievedContext: '',\n      hasContext: false,\n      sources: []\n    }\n  }];\n}\n\n// Build context block\nconst contextBlocks = relevantMatches.map((match, i) => {\n  const meta = match.metadata || {};\n  return `[Chunk ${i+1} | Score: ${match.score.toFixed(3)} | Source: ${meta.fileName || 'unknown'}]\\n${meta.text || ''}`;\n}).join('\\n\\n---\\n\\n');\n\nconst sources = [...new Set(relevantMatches.map(m => m.metadata?.fileName || 'unknown'))];\n\n// Format chat history (last 6 turns)\nconst historyText = chatHistory.slice(-6).map(turn => \n  `${turn.role === 'user' ? 'Usuario' : 'Asistente'}: ${turn.content}`\n).join('\\n');\n\nreturn [{\n  json: {\n    userMessage,\n    sessionId,\n    chatHistory,\n    retrievedContext: contextBlocks,\n    historyText,\n    hasContext: true,\n    sources,\n    matchCount: relevantMatches.length\n  }\n}];"
+      },
+      "id": "09fe5e1d-31d2-4c9d-81bf-cb7f01a8db00",
+      "name": "Build RAG Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the final prompt for the LLM\nconst { userMessage, retrievedContext, historyText, hasContext } = $input.item.json;\n\nconst systemPrompt = `Eres el Asistente de Conocimiento de AIO Strategy, una consultora de AI y datos B2B con sede en Querétaro, México, especializada en manufactura, agroindustria y logística en la región Bajío.\n\nTu función:\n- Responder preguntas sobre documentos, propuestas y casos de uso de AIO Strategy\n- Proporcionar información precisa basada ÚNICAMENTE en el contexto recuperado\n- Si no encuentras la información en el contexto, indicarlo claramente\n- Responder siempre en español, con tono profesional y consultivo\n- Citar las fuentes cuando sea relevante\n\nReglas importantes:\n1. NUNCA inventes información que no esté en el contexto\n2. Si la pregunta está fuera del alcance de los documentos indexados, di: \"No encontré información sobre eso en la base de conocimiento de AIO Strategy\"\n3. Sé conciso pero completo. Máximo 400 palabras salvo que se pida un análisis detallado\n4. Cuando hay contexto suficiente, ofrece insights accionables`;\n\nlet userPrompt;\nif (hasContext) {\n  userPrompt = `CONTEXTO RECUPERADO DE LA BASE DE CONOCIMIENTO:\\n${retrievedContext}\\n\\n`;\n  if (historyText) {\n    userPrompt += `HISTORIAL DE CONVERSACIÓN:\\n${historyText}\\n\\n`;\n  }\n  userPrompt += `PREGUNTA ACTUAL DEL USUARIO:\\n${userMessage}`;\n} else {\n  userPrompt = `No se encontró contexto relevante en la base de conocimiento para esta consulta.\\n\\n`;\n  if (historyText) {\n    userPrompt += `HISTORIAL:\\n${historyText}\\n\\n`;\n  }\n  userPrompt += `PREGUNTA: ${userMessage}\\n\\nResponde indicando que no hay información disponible sobre ese tema en la base de conocimiento de AIO Strategy.`;\n}\n\nconst geminiBodyString = JSON.stringify({\n  system_instruction: {\n    parts: [{ text: systemPrompt }]\n  },\n  contents: [\n    {\n      role: \"user\",\n      parts: [{ text: userPrompt }]\n    }\n  ],\n  generationConfig: {\n    temperature: 0.3,\n    maxOutputTokens: 800\n  }\n});\n\nreturn [{\n  json: {\n    ...$input.item.json,\n    systemPrompt,\n    userPrompt,\n    geminiBodyString\n  }\n}];"
+      },
+      "id": "7c627b0a-78eb-47c7-80d5-a296144d328e",
+      "name": "Build LLM Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Package the final response\nconst llmResult = $input.item.json;\nconst contextData = $('Build RAG Context').item.json;\n\n// Gemini response structure: candidates[0].content.parts[0].text\nconst assistantMessage = llmResult.candidates?.[0]?.content?.parts?.[0]?.text \n  || 'Error al generar respuesta';\n\n// Update chat history\nconst updatedHistory = [\n  ...contextData.chatHistory,\n  { role: 'user', content: contextData.userMessage },\n  { role: 'assistant', content: assistantMessage }\n];\n\n// Keep history manageable (last 20 turns)\nconst trimmedHistory = updatedHistory.slice(-20);\n\nreturn [{\n  json: {\n    response: assistantMessage,\n    sources: contextData.sources || [],\n    matchCount: contextData.matchCount || 0,\n    sessionId: contextData.sessionId,\n    history: trimmedHistory,\n    metadata: {\n      model: 'gemini-2.5-flash',\n      embeddingModel: 'gemini-embedding-001',\n      hasContext: contextData.hasContext,\n      timestamp: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "id": "34bbafc4-ac6c-458d-b297-1c18fb16ddb0",
+      "name": "Format Final Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1584,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "id": "4d490aa0-9ac3-4dd6-b8ed-14841b156a81",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=YOUR_GEMINI_API_KEY",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{$json.geminiBodyString}}",
+        "options": {}
+      },
+      "id": "958f5df5-a9de-441e-93cc-8d87a6cfa5da",
+      "name": "LLM Generate Answer (Gemini 2.5 Flash)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1392,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const embedding = $json.embedding.values;\nconst userMessage = $('Parse & Validate Input').item.json.userMessage;\nconst chatHistory = $('Parse & Validate Input').item.json.chatHistory;\nconst sessionId = $('Parse & Validate Input').item.json.sessionId;\n\nconst pineconeBodyString = JSON.stringify({\n  vector: embedding,\n  topK: 5,\n  includeMetadata: true,\n  namespace: \"aio-strategy-docs\"\n});\n\nreturn [{ \n  json: { \n    embedding, \n    userMessage, \n    chatHistory, \n    sessionId, \n    pineconeBodyString \n  } \n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        0
+      ],
+      "id": "88856fce-3f38-46da-b63b-14bac42b8a21",
+      "name": "Build Pinecone Body"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook Chat Endpoint": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Embed User Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed User Query": {
+      "main": [
+        [
+          {
+            "node": "Build Pinecone Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Pinecone (Top-5 Retrieval)": {
+      "main": [
+        [
+          {
+            "node": "Build RAG Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build RAG Context": {
+      "main": [
+        [
+          {
+            "node": "Build LLM Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build LLM Prompt": {
+      "main": [
+        [
+          {
+            "node": "LLM Generate Answer (Gemini 2.5 Flash)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Final Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Generate Answer (Gemini 2.5 Flash)": {
+      "main": [
+        [
+          {
+            "node": "Format Final Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Pinecone Body": {
+      "main": [
+        [
+          {
+            "node": "Query Pinecone (Top-5 Retrieval)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "80057cda-a6bd-4e69-a127-86325cc56f60",
+  "meta": {
+    "instanceId": "53f75d45acc384e2fc73dc41ec81238b8c0f40a9f721c0444cf58597c8619ead"
+  },
+  "nodeGroups": [],
+  "id": "gU6PLtDDrY52FOcA",
+  "tags": []
+}
